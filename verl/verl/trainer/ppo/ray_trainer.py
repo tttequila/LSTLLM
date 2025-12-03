@@ -1009,6 +1009,12 @@ class RayPPOTrainer:
             else False
         )
         next_step_profile = False
+        
+        # === Customized Memory Manager Instantiation ===
+        # TODO: gen_config = ?
+        # TODO: generation_manager = CustomRolloutWorker.run_batch()
+        # ===============================================
+        
 
         """开始训练"""
         for epoch in range(self.config.trainer.total_epochs):
@@ -1048,9 +1054,11 @@ class RayPPOTrainer:
                         if not self.async_rollout_mode:
                             """同步生成响应，对actor_rollout_worker中的每一个worker都调用worker.rollout执行工具调用和生成任务，所有和rollout相关的流程都发生在这个调用内部"""
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
+                            # TODO: connect to customized rollout worker
                         else:
                             """异步生成响应，就是响应生成的异步版本，异步生成响应是先创建一个future，然后通过future.get()获取结果，这样就可以在后台进行生成，不会阻塞主线程"""
-                            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
+                            # gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
+                            raise NotImplementedError("Async rollout mode is not supported for memory mode")
 
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
