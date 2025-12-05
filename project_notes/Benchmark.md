@@ -49,25 +49,98 @@ Agent: a2_pred
 
 数据由四个子集构成：
 
-1. Accurate Retrieval
-2. Test Time Learning
-3. Long Range Understanding
-4. Conflict Resolution （Selective Forgetting）
+1. **Accurate Retrieval**
 
-结构上如之前提及的两部分组成：
+   这个任务子集主要包含1. eventqa\_\*；2. longmemeval_s\*；3.ruler_qa1/qa2\_\*几种数据来源
+
+   1. **eventqa\_\***：
+
+      - context字段是一个超长字符串文本，通常是长文档的原始文本
+      - questions字段是提问的prompt文本列表
+      - answers字段则包含答案
+      - metadata里的`previous_events`字段提供了一些前序事件，不过通常已经包含在question prompt里了
+
+   2. **longmemeval_***：
+
+      - context字段时间戳和对话交替的列表
+
+        - 时间戳的格式类似于Chat Time: 2022/11/17 (Thu) 12:04
+        - 对话部分则是套用了user-assistant对话模板的交替对话，长度不固定
+
+      - question字段是自带时间戳文本的提问
+
+      - answers字段则是正确答案
+
+      - metadata的`haystack_session`字段提供了RAG查询结果，会返回一系列对话sessions，并且每个对话会被标记上是否包含正确答案，格式是一个三层嵌套的list，第一层元素对应每一个问题，第二层元素对应这个问题查询到的对话session，第三层则是这个session里面的对话turns，以下是session的例子：
+
+        ```json
+        [{'content': "...",
+           'has_answer': False,
+           'role': 'user'},
+          {'content': '...',
+           'has_answer': False,
+           'role': 'assistant'},
+          {'content': "...",
+           'has_answer': True,			# 标记该对话轮次里出现了问题相关的答案
+           'role': 'user'},
+          {'content': '...',
+           'has_answer': False,
+           'role': 'assistant'},
+         	...
+          ],
+        	...                                                                                            ]
+        ```
+
+        `question_types`字段里面有更细分的问题分类
+
+   3. **ruler_***：
+
+      - context字段提供了文档，格式类似`Document n:\n...\n\n`，即文档之间会用空行进行分隔
+      - questions字段就是提问的文本
+      - answers字段是答案关键词列表，一个问题可能有一到两个答案关键词
+
+2. **Test Time Learning**
+
+   主要数据来源是icl，recsys的数据不明确，建议直接过滤掉
+
+   1. **icl_\***：
+      - context字段是一个长文本，文本里面有复数个句子以及对应的数字label，label表示某种潜在分类
+      - questions字段会给出句子列表
+      - answer字段需要根据问题句子返回最接近的句子的label
+
+3. **Long Range Understanding**
+
+   主要数据来源是1. infbench\_\*；2. detective\_\*
+
+   1. **infbench\_\***：主要是长文本总结任务
+      - context字段是一个超长文本，段落之间会用两个空行进行分隔
+      - questions字段是**一个**带shot的总结指令
+      - answers字段则是标准答案
+      - metadata里的`keypoints`字段会提供一些总结关键词
+   2. **detective\_\***：主要是长文本的MCQA任务而不是总结
+      - context字段是带段落号的超长文本
+      - questions字段是多个带shot的MCQA
+      - answer字段是具体的正确答案
+
+4. **Conflict Resolution （Selective Forgetting）**
+
+   主要数据来源是合成数据集 1. factconsolidation_mh/sh_* (sh: single-hop; mh: multi-hop)
+
+   1. **factconsolidation_mh/sh_***:
+      - context字段提供了多个事实条目
+      - questions字段是问题列表
+      - answer则是答案列表，目前来看虽然是嵌套list，但是每个问题只对应一个答案
+
+统一的数据结构为：
 
 ```json
 {
-    "chunks": [
-        {"chunk_id": 1, "text": "... long context part 1 ..."},
-        {"chunk_id": 2, "text": "... long context part 2 ..."},
-        ...
-    ],
-    "questions": [
-        {"qid": 1, "question": "...?"},
-        ...
-    ],
-    "answers": [...]
+    "context": ...,
+    "questions": [[q1], [q2], ..., [qn]],
+    "answers": [[a1], [a2], ..., [an]],
+	"metadata":{
+        "demo", "haystack_sessions", "keypoints", "previous_events", "qa_pair_ids", "question_dates", "question_ids", "question_types", "source"
+    }
 }
 ```
 
