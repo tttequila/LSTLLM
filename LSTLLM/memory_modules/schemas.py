@@ -19,12 +19,14 @@ class TurnSpec:
         turn_id: turn的顺序编号。
         observation: 环境提供的纯文本观察。
         expected_action_type: 该轮模型应输出的动作类型，例如"memory_ops"或"answer"。
+        turn_role: "history" 仅做记忆处理；"target" 需要生成+训练。
         metadata: 记录benchmark相关额外信息（例如chunk id、speaker等）。
     """
 
     turn_id: int
     observation: str
     expected_action_type: str
+    turn_role: str = "target"
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -76,18 +78,21 @@ class StepTrajectory:
     logprobs: torch.FloatTensor
     response_mask: torch.BoolTensor
     metadata: Dict[str, Any] = field(default_factory=dict)
+    step_reward: float | None = None  # 预留逐步奖励，供记忆agent使用
 
     @classmethod
     def from_generation(cls, generation: GenerationOutput, metadata: Dict[str, Any] | None = None) -> "StepTrajectory":
         """辅助方法：由模型输出转换为StepTrajectory."""
 
+        meta = metadata or dict(generation.metadata)
         return cls(
             input_ids=generation.input_ids,
             attention_mask=generation.attention_mask,
             position_ids=generation.position_ids,
             logprobs=generation.logprobs,
             response_mask=generation.response_mask,
-            metadata=metadata or dict(generation.metadata),
+            metadata=meta,
+            step_reward=meta.get("step_reward") if isinstance(meta, dict) else None,
         )
 
 
@@ -100,6 +105,8 @@ class EpisodeTrajectory:
     steps: list[StepTrajectory]
     reward: float
     metadata: Dict[str, Any] = field(default_factory=dict)
+    step_meta: list[Dict[str, Any]] = field(default_factory=list)  # 与step或history事件对齐的元信息
+    step_rewards_ext: list[float] = field(default_factory=list)  # 逐步奖励占位（不进入PPO反向）
 
     def extend(self, step: StepTrajectory) -> None:
         """追加新的step，供runner逐轮写入。"""
@@ -119,5 +126,8 @@ class PackedBatch:
     rewards: torch.FloatTensor
     group_ids: torch.LongTensor
     episode_ids: torch.LongTensor
+    # sidecar，不参与PPO反向，但供记忆agent/调试使用
+    step_meta: list[Dict[str, Any]] | None = None
+    step_rewards_ext: torch.FloatTensor | None = None
 
 

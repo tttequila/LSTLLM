@@ -30,9 +30,11 @@ class TrajectoryBatchBuilder:
             raise ValueError("empty episodes input")
 
         flat_steps: List[StepTrajectory] = []
+        sidecar_meta: List[dict] = []
         episode_ids: List[int] = []
         group_ids: List[int] = []
         rewards: List[float] = []
+        step_rewards_ext: List[float] = []
         group_lookup: dict[str, int] = {}
 
         for ep_idx, ep in enumerate(episodes):
@@ -40,9 +42,15 @@ class TrajectoryBatchBuilder:
             rewards.append(reward)
             group_idx = group_lookup.setdefault(ep.group_id, len(group_lookup))
             for step in ep.steps:
+                turn_role = step.metadata.get("turn_role", "target")
+                # 仅训练目标轮；历史轮保留在 sidecar meta，由记忆agent消费
+                if turn_role == "history":
+                    continue
                 flat_steps.append(step)
                 episode_ids.append(ep_idx)
                 group_ids.append(group_idx)
+                sidecar_meta.append(dict(step.metadata))
+                step_rewards_ext.append(step.step_reward if step.step_reward is not None else 0.0)
 
         if not flat_steps:
             raise ValueError("episodes contain zero steps")
@@ -76,6 +84,8 @@ class TrajectoryBatchBuilder:
             rewards=reward_tensor,
             group_ids=torch.tensor(group_ids, dtype=torch.long),
             episode_ids=torch.tensor(episode_ids, dtype=torch.long),
+            step_meta=sidecar_meta,
+            step_rewards_ext=torch.tensor(step_rewards_ext, dtype=torch.float32),
         )
 
 

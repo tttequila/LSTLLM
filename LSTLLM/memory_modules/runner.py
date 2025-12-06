@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Callable
+from typing import Callable, Dict, List
 
 import torch
 from verl import DataProto
@@ -69,6 +69,8 @@ class EpisodeRunner:
                 steps=[],
                 reward=0.0,
                 metadata={"final_query": batch_input.final_query},
+                step_meta=[],
+                step_rewards_ext=[],
             )
             for batch_input in batch_inputs
         ]
@@ -100,7 +102,17 @@ class EpisodeRunner:
 
                 # grep current turn for all active data instances
                 turn = batch_input.turns[turn_indices[bi_idx]]
-                # render prompt
+                # history turns: only memory ops, no model call
+                if getattr(turn, "turn_role", "target") == "history":
+                    memory_states[bi_idx], history_meta = self._run_history_turn(batch_input, turn, memory_states[bi_idx])
+                    trajectories[bi_idx].step_meta.append(history_meta)
+                    trajectories[bi_idx].step_rewards_ext.append(history_meta.get("step_reward", 0.0) or 0.0)
+                    turn_indices[bi_idx] += 1
+                    if turn_indices[bi_idx] >= len(batch_inputs[bi_idx].turns):
+                        finished.append(bi_idx)
+                    continue
+
+                # render prompt for target turn
                 call_config = self._prompt_builder.build_turn_prompt(batch_input, turn, memory_states[bi_idx])
                 # form batch
                 batch_configs.append(call_config)
@@ -121,6 +133,8 @@ class EpisodeRunner:
             for generation, bi_idx, turn in zip(generations, batch_input_idx, batch_turns):
                 # record the step metadata
                 step_meta = self._build_step_metadata(turn, generation)
+                trajectories[bi_idx].step_meta.append(step_meta)
+                trajectories[bi_idx].step_rewards_ext.append(step_meta.get("step_reward", 0.0) or 0.0)
                 # rolling update the trajectory
                 trajectories[bi_idx].extend(StepTrajectory.from_generation(generation, metadata=step_meta))
                 # update the memory state
@@ -142,12 +156,28 @@ class EpisodeRunner:
 
         return False
 
+    def _run_history_turn(self, batch_input: BatchInput, turn: TurnSpec, state: MemoryState) -> tuple[MemoryState, Dict]:
+        """处理历史轮：只做记忆抽取/压缩，记录元信息."""
+
+        new_state, fact_meta = self._memory_manager.extract_facts(state, turn)
+        new_state, st_meta = self._memory_manager.compress_short_term(new_state, turn)
+        meta = {
+            "turn_id": turn.turn_id,
+            "turn_role": "history",
+            "action_type": turn.expected_action_type,
+            "turn_metadata": turn.metadata,
+            "memory_ops": {"facts": fact_meta, "short_term": st_meta},
+            "step_reward": None,  # 留给后处理
+        }
+        return new_state, meta
+
     def _build_step_metadata(self, turn: TurnSpec, generation: GenerationOutput) -> dict:
         """组合方便debug的元信息."""
 
         return {
             "turn_id": turn.turn_id,
             "action_type": turn.expected_action_type,
+            "turn_role": getattr(turn, "turn_role", "target"),
             "raw_text": generation.text,
             "turn_metadata": turn.metadata,
         }

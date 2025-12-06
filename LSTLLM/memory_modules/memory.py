@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Protocol
+from typing import Any, Dict, List, Protocol, Tuple
 
 from .schemas import BatchInput, TurnSpec
 
@@ -25,8 +25,14 @@ class MemoryManager(Protocol):
     def initialize_input(self, batch_input: BatchInput) -> MemoryState:
         """为新的输入样本创建初始记忆."""
 
+    def extract_facts(self, state: MemoryState, turn: TurnSpec) -> Tuple[MemoryState, Dict[str, Any]]:
+        """从历史轮对话中提取事实，更新长期记忆，返回记忆操作元信息."""
+
+    def compress_short_term(self, state: MemoryState, turn: TurnSpec) -> Tuple[MemoryState, Dict[str, Any]]:
+        """对近段对话做短期记忆压缩，返回摘要相关元信息."""
+
     def update_memory(self, state: MemoryState, turn: TurnSpec, model_text: str) -> MemoryState:
-        """根据模型输出更新记忆."""
+        """根据模型输出更新记忆（通常用于目标轮生成后）."""
 
 
 class PassthroughMemoryManager:
@@ -34,6 +40,14 @@ class PassthroughMemoryManager:
 
     def initialize_input(self, batch_input: BatchInput) -> MemoryState:
         return {"sample_metadata": batch_input.metadata}
+
+    def extract_facts(self, state: MemoryState, turn: TurnSpec) -> Tuple[MemoryState, Dict[str, Any]]:
+        # no-op fact extraction
+        return state, {"facts_written": []}
+
+    def compress_short_term(self, state: MemoryState, turn: TurnSpec) -> Tuple[MemoryState, Dict[str, Any]]:
+        # no-op short-term compression
+        return state, {"short_term_summary": None}
 
     def update_memory(self, state: MemoryState, turn: TurnSpec, model_text: str) -> MemoryState:
         state = dict(state)
