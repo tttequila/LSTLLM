@@ -21,6 +21,14 @@ RayPPOTrainer.fit
 
 ---
 
+## QA级 Episode 设计
+
+- **数据粒度**：上游数据洗成“(chunk 序列, question, answer)”的 QA 子样本，每条子样本拥有独立 `group_id=sample_id-q{idx}`。同一原始样本内的多个 QA 共用 `chunks`，但在数据层已经展开，便于 Verl 在组内扩增前就以 QA 粒度 repeat。
+- **rollout 输入**：CustomRolloutWorker 每次接收的 `BatchInput` 仅包含一个 QA；需要在 episode 开始时 replay 全部/窗口化 `chunks` 以重建 Memory state，然后进入最终 question 的生成。
+- **GRPO 行为**：RayPPOTrainer 仍然在最外层按 `group_id` 做 repeat。由于 `group_id` 已经是 QA 级，组内扩增天然覆盖 QA agent 与记忆 agent，reward 也按 QA 级 episode 计算并广播。
+
+---
+
 ## 关键步骤
 
 1. **RayPPOTrainer.fit**
@@ -28,7 +36,7 @@ RayPPOTrainer.fit
    - 输入：dataloader 产出的原始 batch（dict/Tensors）以及 tokenizer。
 
 2. **Dataset Adapter → BatchInput**
-   - 训练 batch 里的每条样本通过适配器转成 `BatchInput`：
+   - 训练 batch 里的每条 **QA 子样本** 通过适配器转成 `BatchInput`：
      - `episode_id`/`group_id`
      - `turns: List[TurnSpec]`，区分：
        - `turn_role=history`：现成对话历史，仅供记忆处理
@@ -49,7 +57,7 @@ RayPPOTrainer.fit
         - 可选：记录检索/写入日志到 `memory_ops`，预留 step-wise 奖励占位。
      2. `turn_role=target`：
         - `PromptBuilder.build_turn_prompt` 注入长期检索结果 + 短期摘要。
-        - `PolicyClient.generate`（vLLM/FSDP 等）返回 `GenerationOutput`。
+        - `PolicyClient.generate`（vLLM/FSDP 等）返回 `GenerationOutput`。此阶段同时负责 QA agent 的回答与记忆 agent 的回读。
         - `StepTrajectory.from_generation` 收集 token/logprob/mask。
         - `MemoryManager.update_memory` 用生成结果更新记忆。
    - Episode 结束后用 `RewardFn` 计算 episode 级 scalar reward（用于策略），写进 `EpisodeTrajectory`；逐步奖励留给记忆 agent 后处理。
@@ -72,11 +80,12 @@ RayPPOTrainer.fit
 
 - **替换点**：`RayPPOTrainer.fit` 中 `gen_batch_output = self.actor_rollout_wg.generate_sequences(...)` 那一段改为调用 Phase0 rollout，并把返回的 `PackedBatch` 填充到 `batch.batch` 的相应字段。
 - **Group/Reward 对齐**：`group_id` 需与 dataloader 样本分组一致，用于 GRPO 的组内归一化；reward 是 episode 级别的 scalar，广播给该 episode 所有 step。
+- **QA 粒度扩增**：由于 `group_id` 在数据洗阶段已经细化到 QA 级，RayPPOTrainer 的组内 repeat 会得到 B×q×n 条轨迹；rollout 端无需再动态拆分，只需按照输入的 QA 子样本执行完整 episode。
 - **多轮历史与目标轮解耦**：历史轮仅做记忆处理与压缩，目标轮才生成并进入训练；Memory/PPO 两条链路通过 `step_meta`+sidecar 解耦。
 - **逐步奖励接口**：`TrajectoryBatchBuilder` 需保留 `step_meta/step_rewards_ext`，以便后续对事实拆分、长期记忆写入、短期压缩做 step-wise 奖励。
 - **扩展性**：Prompt 模板、记忆写入、Policy 后端都通过接口注入，后续 Phase1/2 只需替换对应实现，RayPPOTrainer 的主流程无需再次调整。
 
 ---
 
-（最后更新：2025-12-01）
+（最后更新：2025-12-06）
 

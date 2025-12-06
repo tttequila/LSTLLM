@@ -39,3 +39,36 @@
 - **config (DictConfig)** – Options like cache_dir, prompt_key, max_prompt_length, truncation, etc.
 
 - **processor (ProcessorMixin, optional)** – Multimodal preprocessor for images/videos.
+
+---
+
+## MemoryAgentBench → QA级样本
+
+> 目标：在进入 Verl 前就把 MemoryAgentBench 洗成 “QA 粒度” 的行，从而让 GRPO 的组内扩增直接作用在 question 级 episode 上。
+
+1. **拆分粒度**
+   - 每条原始实例可能包含 `chunks` + 多个 `questions_and_answers`。
+   - 预处理时将其展开：每条 QA 生成一行，带上同一份 `chunks`（或预裁剪 window）以及唯一 `group_id = f"{sample_id}-q{idx}"`。
+   - 这样 RayPPOTrainer 在最外层 repeat n 次时，会得到 `B × q × n` 条 episode。
+
+2. **列设计**
+   - `prompt`：仍采用统一 system 指令 + 最终 user 提问。历史 chunk 不直接写进 prompt，而是放入 `extra_info`，由 rollout 自行 replay。
+   - `extra_info` 约定字段：
+     - `chunks`: List[str]，供事实拆分/记忆 agent 重放。
+     - `question`: 当前 QA 的完整提问。
+     - `answers`: 参考答案（list or str），reward 计算所需。
+     - `sample_id` / `question_idx` / `group_id`: 追踪原始来源与 GRPO 分组。
+     - `chunk_window_meta`: 可选，记录 chunk 时间窗或 source 标签，方便 rollout 做窗口化。
+
+3. **rollout 配合**
+   - CustomRolloutWorker 拿到 QA 行后，先遍历 `chunks` 执行事实拆分 → 长期记忆写入 → 短期压缩，再切换到 `prompt` 的最终 user 问题。
+   - reward 以 QA 粒度计算，并广播给该 episode 的生成 token。
+   - 如需同时训练“仅记忆管理”的子任务，可在同一 extra_info 中附加 flag，由 rollout 选择不同模式。
+
+4. **兼容 RLHFDataset**
+   - 以上字段均可写入 Parquet；`prompt_key` 指向 `prompt`，`extra_info_key` 指向 `extra_info`。
+   - `group_id` 放在 `extra_info` 内，供 `RLHFDataset` 在 collate 阶段拷贝到张量批次中。
+
+---
+
+（最后更新：2025-12-06）

@@ -144,6 +144,81 @@ Agent: a2_pred
 }
 ```
 
+---
+
+
+## Mem-alpha的MemoryAgentBench处理流程
+
+`process_memory_agent_bench()` 里确实按数据来源做了多层分类处理，来适配 MemoryAgentBench 各子任务的“杂乱”格式。
+
+- **统一入口 + 初步过滤**：加载指定 split 后，先用 `metadata.source` 过滤掉 `niah`、`longmemeval_s_-1_500`、`eventqa_*`、`infbench_qa_eng_shots2`、`recsys_redial_full` 等超长或不适配的来源，确保后续逻辑只面对可控子集  
+
+```3260:3288:Mem-alpha/process_data.py
+if 'niah' in item['metadata'].get('source', ''): continue
+if item['metadata']['source'] in [..., 'infbench_qa_eng_shots2']: continue
+```
+
+- **`longmemeval_s*` 专用通道**：对于这类“交替 timestamp + session 列表”的对话式 context，代码把每个 session 渲染为 `[Dialogue at timestamp ...]` 块：  
+  - 逐 turn 校验结构，若单 turn 超长就用 `split_large_turn()` 先按句子/词切割，再由 `split_session_into_segments()` 组合成 ≤2048 token 的 segment；  
+  - 组合 segment 时保持 `<User>/<Assistant>` 格式，并在 chunk 间拼接保证接近 2k token；  
+  - 最终断言每个 chunk token 数合法  
+
+```3300:3513:Mem-alpha/process_data.py
+if item['metadata']['source'] == 'longmemeval_s*':
+    ... render_session(...)
+    ... split_large_turn(...)
+    ... split_session_into_segments(...)
+    assert count_tokens(chunk) <= 2048
+```
+
+- **TTL（Test_Time_Learning）**：先粗略按句子切块（max 1024），再把“Sentence … label …”重排成固定格式，套用 classification 模板 `[Dialogue between User and Assistant ...] + CLASSIFICATION_USER_TEMPLATES`，保证 few-shot 分类数据都有统一的句子+标签样式  
+
+```3516:3671:Mem-alpha/process_data.py
+elif split == 'Test_Time_Learning':
+    chunks = create_chunks_use_sent_tokenizer(...1024)
+    ...
+    sentence,label = x.split("label:")
+    chunk_content = f"Sentence: ...\nLabel: ..."
+    formatted_chunk = f"[Dialogue ...]\n<User>{CLASSIFICATION_USER_TEMPLATES}\n{chunk_content}\n<Assistant>..."
+```
+
+- **其他 Accurate Retrieval 来源**：默认用 2048 token 句子切块，再根据 `source` 细分模板：  
+  - `infbench_qa_eng_shots2` 走 BookSum 风格（事件日期 + `<System>` 提示）；  
+  - 其余来源走“日期+User/Assistant 模板”；  
+  - 所有 QA 原样保留（`question`,`answer`）  
+
+```3577:3633:Mem-alpha/process_data.py
+elif split == 'Accurate_Retrieval' and ... == 'infbench_qa_eng_shots2':
+    formatted_chunk = f"[Event happened on ...]"
+elif split == 'Accurate_Retrieval' and ...:
+    formatted_chunk = f"[Dialogue between User and Assistant ...]"
+```
+
+- **Long Range Understanding**：无论 context 原始形式怎样，统一转成 BookSum 式 `[Event happened on ...]`，QA 改成“Summarize ... from start_date to end_date”，答案替换成预先抽取的关键词，附 `reading_dates` 供下游使用  
+
+```3536:3575:Mem-alpha/process_data.py
+if split == 'Long_Range_Understanding':
+    formatted_chunk = f"[Event happened on ...]"
+    updated_qa['question'] = "Summarize ... from {first_date} to {last_date}."
+    updated_qa['answer'] = answers_to_keywords_mapping[str(item_idx)]['keywords']
+```
+
+- **统一输出**：无论哪类来源，最后都生成 `prompt + chunks + questions_and_answers` 的标准实例，并保留 `data_source`（accurate_retrieval/long_range_understanding）和 `sub_source`（原始 metadata.source），方便下游分别处理  
+
+```3674:3689:Mem-alpha/process_data.py
+data_instance = {
+    'prompt': 'I will provide you with sequential information chunks...',
+    'chunks': chunks,
+    'questions_and_answers': questions_and_answers,
+    'data_source': ...,
+    'sub_source': item['metadata']['source']
+}
+```
+
+所以，MemoryAgentBench 的“杂乱” context 会先按 `split` 与 `metadata.source` 分流：长对话（longmemeval_s*）→ turn 级切分；TTL → 句子+label 模板；书本/总结类 → BookSum 模板；普通检索 → User/Assistant 模板。这样可以把不同格式的原始数据统一到记忆代理可消费的 prompt 结构中。
+
+---
+
 # MemoryBench (Ai, etc., 2015)
 
 MemoryBench的每条数据本质上是 一个任务样本 $(q, c, v)$， 即*用户指令+任务上下文+答案/打分准则*，和一段多轮交互日志 dialog + 一段隐式反馈日志 implicit feedback
