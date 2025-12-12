@@ -541,6 +541,7 @@ class RayPPOTrainer:
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
 
+            # if uid not in non_tensor_batch, generate a new uid for each sample (uid will be used for GRPO grouping)
             if "uid" not in test_batch.non_tensor_batch:
                 test_batch.non_tensor_batch["uid"] = np.array(
                     [str(uuid.uuid4()) for _ in range(len(test_batch.batch))], dtype=object
@@ -1037,7 +1038,7 @@ class RayPPOTrainer:
                     [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
                 )
 
-                """构造包含prompt的generation batch，并将全局步数写入meta信息"""
+                """移除non_tensor_batch信息（保留"data_source", "reward_model", "extra_info", "uid"）并将全局步数写入meta信息"""
                 gen_batch = self._get_gen_batch(batch)
                 gen_batch.meta_info["global_steps"] = self.global_steps
                 """为每个worker重复gen_batch，用于生成多个响应"""
@@ -1054,7 +1055,16 @@ class RayPPOTrainer:
                         if not self.async_rollout_mode:
                             """同步生成响应，对actor_rollout_worker中的每一个worker都调用worker.rollout执行工具调用和生成任务，所有和rollout相关的流程都发生在这个调用内部"""
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
-                            # TODO: connect to customized rollout worker
+                            
+                            """TODO: connect to customized rollout worke
+                            到这一步为止，gen_batch_output经过了赋予uid，组内重复，
+                            移除"data_source", "reward_model", "extra_info", "uid"等non_tensor_batch信息
+                            主要包含的成员包括：
+                            1. input_ids: 
+                            2. attention_mask: 
+                            3. position_ids:
+                            4. 除 "data_source", "reward_model", "extra_info", "uid" 以外的non_tensor_batch信息
+                            """
                         else:
                             """异步生成响应，就是响应生成的异步版本，异步生成响应是先创建一个future，然后通过future.get()获取结果，这样就可以在后台进行生成，不会阻塞主线程"""
                             # gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
@@ -1095,8 +1105,9 @@ class RayPPOTrainer:
                             del rm_scores, gen_baseline_batch, gen_baseline_output
                     
                     # repeat to align with repeated responses in rollout
-                    """复制batch"""
+                    """复制batch对齐组内样本"""
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    """将生成响应之后的batch更新至原batch中，uid等生成无关的数据会直接沿用原batch的值"""
                     batch = batch.union(gen_batch_output)
 
                     """如果生成响应时没有生成response掩码，则计算response掩码"""

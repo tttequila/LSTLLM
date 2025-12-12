@@ -124,15 +124,16 @@ reward = evaluate(final_answer, ground_truth)
 
 目标：
 
-* vLLM + LoRA + VeRL 实现自定义 rollout（支持多轮 generate）
-* 将多个 benchmark 转成统一 multi-turn 格式
-* 能训练一个简单 policy（不用 memory）
+* vLLM + LoRA + VeRL 实现自定义 rollout（支持多轮 generate、多 agent 分支）
+* 将多个 benchmark 转成统一 multi-turn 格式，按 **question 粒度** 展开
+* 不在数据侧套 chat 模板；per-agent prompt 渲染与 padding 放在 rollout
+* 能训练一个简单 policy，并为记忆链路留好接口
 
 关键成果：
 
-* 确立了 multi-turn 数据结构
-* 定义了统一的环境接口（obs → action → next_obs）
-* 所有 benchmark 均可作为 multi-turn episodes 驱动 rollout
+* 确立了 multi-turn / multi-agent 数据结构（question 粒度 + agent_plan）
+* 定义了统一的环境接口（obs → action → next_obs），模板化/padding 由自定义 rollout 负责
+* 所有 benchmark 均可作为 multi-turn episodes 驱动 rollout，并按 agent 维展开后再统一更新
 * 技术路线上已明确：rollout 必须自己写，不依赖 VeRL AgentLoop
 
 ## **Phase 1：加入隐式 Memory（Mem-α 类）**
@@ -174,7 +175,7 @@ RayPPOTrainer.fit()
   │     │     │     ├─ 每个 turn 调模型一次或多次（记忆更新 + 回答）
   │     │     │     └─ 收集成 EpisodeTrajectory（token, logprob, mask, meta）
   │     │     └─ 返回 (episode_traj_i_j, scalar_reward_i_j)
-  │     └─ 记录 group_id = 样本 i 的 id，用于 GRPO 分组
+  │     └─ 记录 group_id = 本次 fit 生成的 uid（或样本 id 仅用于追踪），用于 GRPO 分组
   ├─ 将所有 EpisodeTrajectory + reward + group_id
   │   flatten & pad → 统一成若干 tensor
   │   → 封装成 DataProto
@@ -184,8 +185,10 @@ RayPPOTrainer.fit()
 
 关键点：
 
-* **一个 episode = 一整条对话轨迹**（包含多轮 memory ops + 回复）
-* **一个 group = 同一条输入对话，在同一 step 生成的多条不同 rollout**（多次采样）
+* **一个 episode = 一整条对话/agent 轨迹**（包含多轮 memory ops + 回复）
+* **一个 group = 同一条输入 QA，在同一步采样出的多条 rollout**（多次采样；训练时使用 Verl 生成的 `uid` 分组，自定义 sample_id 仅做追踪）
+* **并列 agent 处理**：同一输入若需多个角色并行（事实拆分/长记/短记/answer），在 rollout/adapter 中形成“agent 维度”，再与 batch 维展开为 `[batch*agents, ...]`，统一进入一次 update；`agent_role` 通过 side meta 区分，避免梯度混杂。
+* **模板化位置**：数据侧不套 chat 模板；per-agent prompt/plan 从 `extra_info` 读取，模板渲染与 padding 由自定义 rollout 完成。
 * Verl 的 GRPO 只看到：
 
   * 一批 token 序列 + 对应 logprobs、response_mask
@@ -220,6 +223,9 @@ class StepTrajectory:
     tool_calls: List[Dict[str, Any]] = field(default_factory=list)
     # 可选：如果你有 per-step 工具 reward，可以先记在这
     step_reward: float = 0.0
+    # 可选：agent role / turn role，用于后续过滤或日志
+    agent_role: str = ""
+    turn_role: str = ""
 ```
 
 **说明：**
@@ -432,7 +438,7 @@ data_proto = DataProto(
 
        * 计算 advantage（group 内中心化/归一化）；
        * 计算 policy loss / KL loss / value loss 等；
-       * 反向传播，更新 LoRA 参数。
+       * 反向传播，更新 LoRA 参数（按 `response_mask` 过滤非训练角色）。
 
 整个 pipeline 的**信息流**可以总结为：
 

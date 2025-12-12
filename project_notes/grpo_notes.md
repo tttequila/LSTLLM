@@ -5,6 +5,7 @@
    - 在 `RayPPOTrainer.fit()` 中，通过 `gen_batch.repeat(repeat_times=n, interleave=True)` 对每条输入复制 `n` 份（`@verl/verl/trainer/ppo/ray_trainer.py:1044-1047`）。
    - 复制后的 `DataProto` 交给 rollout worker (`actor_rollout_wg.generate_sequences`) 做推理，生成 `B × n` 条候选轨迹。
    - 同一原始样本的所有副本共享同一个 `group_id`（通常来自 `non_tensor_batch["uid"]`），用于后续 GRPO 归一化。
+   - 组号来源：当前实现直接在 fit 阶段为每条样本生成临时 UUID 写入 `non_tensor_batch["uid"]`，覆盖数据侧可能已有的 `group_id`。要使用数据清洗阶段的稳定组号，需在 dataloader/fit 里显式传递该字段并取消覆盖。
 
 2. **轨迹回传与奖励**
    - Rollout 结束后，框架会补充 `old_log_probs`、`token_level_scores`、`token_level_rewards` 等字段，仍以 `DataProto` 形式返回。
