@@ -87,15 +87,9 @@ def _ensure_parent_dir(path: str) -> None:
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
 
 
-def _json_dumps(content: Any, cache_path: Optional[str]=None) -> str:
-    """将任意 Python 结构序列化为 UTF-8 JSON 字符串。"""
-    if cache_path:
-        print(f"Caching processed rows to {cache_path}...")
-        with open(cache_path, 'w', encoding='utf-8') as f:
-            json.dump(content, f, ensure_ascii=False, indent=2)
-        return cache_path
-    else:
-        return json.dumps(content, ensure_ascii=False)
+def _json_dumps(content: Any) -> str:
+    """将 Python 结构安全地序列化为 UTF-8 JSON 字符串。"""
+    return json.dumps(content, ensure_ascii=False)
 
 
 def _count_parquet_rows(path: str) -> int:
@@ -325,9 +319,8 @@ def _qa_rows_from_entry_multi_agent(
         )
         
         pre_agent = {agent_id: _build_prompt(agent_id) for agent_id in agent_ids}
-        # pre_agent_str = _json_dumps(pre_agent_str)
             
-        extra_info_str: Dict[str, Any] = {
+        extra_info: Dict[str, Any] = {
             "data_source": data_source,
             "sub_source": sub_source,
             "pre_agent": pre_agent,         # dict of agent_id: prompt
@@ -338,27 +331,33 @@ def _qa_rows_from_entry_multi_agent(
             "turn_metadata": turn_metadata,         # list of dicts
         }
         if reading_dates:
-            extra_info_str["reading_dates"] = reading_dates
+            extra_info["reading_dates"] = reading_dates
 
-        extra_info_str = _json_dumps(extra_info_str)
+        # raw metadata in memory agent bench is shcema inconsistent, so directly dump as json string
+        metadata_json = _json_dumps(metadata)
 
         row = {
-                "prompt": _json_dumps(prompt),
-                "chunks": _json_dumps(chunks),      # list
+                "prompt": prompt,
+                "chunks": chunks,      # list
                 "num_chunks": len(chunks),
                 "question": question,
-                "answers": _json_dumps(answers_list),  # list
+                "answers": answers_list,  # list
                 "target_answer": answers_list[0] if answers_list else "",
                 "agent_role": "answer_gen",
                 "data_source": data_source,
                 "sub_source": sub_source,
-                "extra_info": extra_info_str,       # second-order nested dict
-                "metadata": _json_dumps(metadata),
+                "extra_info": extra_info,       # second-order nested dict
+                "metadata": metadata_json,
             }
         
         # assert all stored values are acceptable types
+        allowed_value_types = (str, int, float, dict, list)
         for k, v in row.items():
-            assert isinstance(v, str) or isinstance(v, int) or isinstance(v, float) , f"Expected value to be str, int, or float, got {type(v)} for key {k}"
+            if v is None:
+                continue
+            assert isinstance(v, allowed_value_types), (
+                f"Expected value to be one of {allowed_value_types} (or None), got {type(v)} for key {k}"
+            )
 
         rows.append(row)
         
@@ -551,7 +550,6 @@ def _chunk_context_longmemeval(contexts: str, max_tokens: int, tokenizer: AutoTo
         return chunks
     
 def process_memoryagentbench_raw(
-    *,
     split: Optional[str] = None,
     output_path: str = "./data",
     max_tokens_per_chunk: int = 2048,
