@@ -128,6 +128,73 @@ Just return the label CORRECT or WRONG in a json format with the key as "label".
 # 辅助函数
 # ======
 
+def save_processed_data(data, filename="processed_data.json"):
+    """Save processed data to JSON file"""
+    print(f"Saving {len(data)} instances to {filename}...")
+    with open(filename, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    print(f"Data saved to {filename}")
+    
+
+def convert_json_to_parquet(json_filename, dataset_name):
+    """Convert JSON file to parquet format and save in ./data/memalpha/"""
+
+    # Create output directory
+    output_dir = "./data/memalpha"
+    os.makedirs(output_dir, exist_ok=True)
+
+    print(f"Converting {json_filename} to parquet format...")
+
+    # Load JSON data
+    with open(json_filename, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+
+    # Convert to DataFrame-friendly format
+    rows = []
+    for i, instance in enumerate(data):
+        # Handle both 'chunks' and 'context_chunks' keys
+        chunks_key = 'chunks' if 'chunks' in instance else 'context_chunks'
+        # Convert chunks list to string representation
+        chunks_str = json.dumps(instance[chunks_key])
+
+        if len(instance['questions_and_answers']) > 100:
+            # random sample 100 questions_and_answers
+            instance['questions_and_answers'] = random.sample(instance['questions_and_answers'], 100)
+
+        # Convert questions_and_answers to string representation
+        qa_str = json.dumps(instance['questions_and_answers'])
+
+        row = {
+            'instance_id': i,
+            'prompt': instance.get('prompt', ''),  # Use get() with default for lme_train
+            'chunks': chunks_str,
+            'questions_and_answers': qa_str,
+            'num_chunks': len(instance[chunks_key]),
+            'num_questions': len(instance['questions_and_answers']),
+        }
+
+        if 'sub_source' in instance:
+            row['sub_source'] = instance['sub_source']
+        elif 'data_source' in instance:
+            row['sub_source'] = instance['data_source']
+        elif 'metadata' in instance:
+            row['sub_source'] = instance['metadata']['source']
+
+        rows.append(row)
+
+    # Create DataFrame
+    df = pd.DataFrame(rows)
+
+    # Save as parquet
+    parquet_filename = os.path.join(output_dir, f"processed_{dataset_name}_data.parquet")
+    df.to_parquet(parquet_filename, index=False)
+
+    print(f"Parquet file saved to {parquet_filename}")
+    print(f"Parquet file contains {len(df)} instances")
+
+    return parquet_filename
+
+
 
 def judge_answer_with_token_logic(ground_truth_answer, predicted_answer, debug=False):
     """

@@ -15,10 +15,13 @@ from functools import lru_cache
 from typing import Any, Dict, List, Sequence, Optional
 
 import pandas as pd
-from datasets import load_dataset, concatenate_datasets
+from datasets import load_dataset
 import tiktoken
 import random
 from transformers import AutoTokenizer
+from tqdm import tqdm
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 
 # UNI_SYS_PROMPTS = []
@@ -84,8 +87,88 @@ def _ensure_parent_dir(path: str) -> None:
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
 
 
+def _json_dumps(content: Any, cache_path: Optional[str]=None) -> str:
+    """将任意 Python 结构序列化为 UTF-8 JSON 字符串。"""
+    if cache_path:
+        print(f"Caching processed rows to {cache_path}...")
+        with open(cache_path, 'w', encoding='utf-8') as f:
+            json.dump(content, f, ensure_ascii=False, indent=2)
+        return cache_path
+    else:
+        return json.dumps(content, ensure_ascii=False)
+
+
+def _count_parquet_rows(path: str) -> int:
+    """返回 parquet 文件的行数，用于断点续跑定位。"""
+    if not os.path.exists(path):
+        return 0
+    parquet_file = pq.ParquetFile(path)
+    return parquet_file.metadata.num_rows
+
+
+class _ParquetBatchWriter:
+    """
+    分批写 parquet，并在存在历史文件时执行断点续写：
+        1. 启动时若检测到目标文件，先重命名为 .resume.bak；
+        2. 首次写入时将 bak 中已有数据逐个 row group 复制到新文件，再继续写新数据；
+        3. 若最终没有追加任何数据，则还原 bak。
+    """
+
+    def __init__(self, output_path: str, resume: bool = True):
+        self.output_path = os.path.abspath(output_path)
+        self._writer: pq.ParquetWriter | None = None
+        self._resume_backup: str | None = None
+        self._resume_rows = 0
+        self._rows_written = 0
+
+        _ensure_parent_dir(self.output_path)
+
+        if resume and os.path.exists(self.output_path):
+            self._resume_rows = _count_parquet_rows(self.output_path)
+            backup_path = f"{self.output_path}.resume.bak"
+            os.replace(self.output_path, backup_path)
+            self._resume_backup = backup_path
+        elif not resume and os.path.exists(self.output_path):
+            os.remove(self.output_path)
+
+    @property
+    def resume_rows(self) -> int:
+        return self._resume_rows
+
+    def _ensure_writer(self, table: pa.Table) -> None:
+        if self._writer is None:
+            self._writer = pq.ParquetWriter(self.output_path, table.schema)
+            if self._resume_backup:
+                self._copy_existing()
+
+    def _copy_existing(self) -> None:
+        """将历史文件内容拷贝到新的 writer。"""
+        if not self._resume_backup:
+            return
+        parquet_file = pq.ParquetFile(self._resume_backup)
+        for row_group_idx in range(parquet_file.num_row_groups):
+            self._writer.write_table(parquet_file.read_row_group(row_group_idx))
+        os.remove(self._resume_backup)
+        self._resume_backup = None
+
+    def write_rows(self, rows: Sequence[Dict[str, Any]]) -> None:
+        if not rows:
+            return
+        table = pa.Table.from_pandas(pd.DataFrame(rows), preserve_index=False)
+        self._ensure_writer(table)
+        self._writer.write_table(table)
+        self._rows_written += len(rows)
+
+    def close(self) -> None:
+        if self._writer is not None:
+            self._writer.close()
+            self._writer = None
+        elif self._resume_backup:
+            # 未追加新数据，直接恢复原文件
+            os.replace(self._resume_backup, self.output_path)
+            self._resume_backup = None
+
 def _save_rows(rows: Sequence[Dict[str, Any]], output_path: str) -> str:
-    """将样本列表保存为 parquet，并返回最终路径。"""
     _ensure_parent_dir(output_path)
     df = pd.DataFrame(rows)
     df.to_parquet(output_path, index=False)
@@ -195,7 +278,7 @@ def _qa_rows_from_entry_multi_agent(
     qa_pairs: Sequence[Dict[str, Any]],
     base_sample_id: str,
     data_source: str,
-    sub_source: str | None,
+    metadata: Dict[str, Any],
     agent_ids: Sequence[str] = ["answer_gen", "fact_split", "long_mem", "short_mem"],
     reading_dates: Dict[str, Any] | None = None,
 ) -> List[Dict[str, Any]]:
@@ -204,6 +287,8 @@ def _qa_rows_from_entry_multi_agent(
     """
     
     rows = []
+
+    sub_source = metadata.get("source", 'null') if "source" in metadata.keys() else metadata.get("sub_source", 'null')
 
     for q_idx, qa in enumerate(qa_pairs):
         
@@ -221,36 +306,61 @@ def _qa_rows_from_entry_multi_agent(
 
         # chunk related
         turn_roles = ["history"] * len(chunks) + ["target"]
-        turn_metadata = [{} for _ in chunks]
-
-        extra_info: Dict[str, Any] = {
-            "question": question,
-            "answers": answers_list,
-            "target_answer": answers_list[0] if answers_list else "",
-            "chunks": chunks,
-            "data_source": data_source,
-            "sub_source": sub_source,
-            "agent_role": "answer_gen",
-            "pre_agent": {
-                agent_id: _build_prompt(agent_id) for agent_id in agent_ids
-                },
-            "meta_info":{
-                "sample_id": sample_id,
-                "instance_id": instance_id,
-                "question_idx": q_idx,
-                "turn_roles": turn_roles,
-                "turn_metadata": turn_metadata,
-            }
-        }
-        if reading_dates:
-            extra_info["reading_dates"] = reading_dates
-
-        rows.append(
+        turn_metadata = [
             {
-                "prompt": prompt,
-                "extra_info": extra_info,
+                "chunk_idx": idx,
+                "role": "history",
+                "token_count": _count_tokens(chunk),
+                "char_count": len(chunk),
+            }
+            for idx, chunk in enumerate(chunks)
+        ]
+        turn_metadata.append(
+            {
+                "chunk_idx": len(chunks),
+                "role": "target",
+                "token_count": 0,
+                "char_count": 0,
             }
         )
+        
+        pre_agent = {agent_id: _build_prompt(agent_id) for agent_id in agent_ids}
+        # pre_agent_str = _json_dumps(pre_agent_str)
+            
+        extra_info_str: Dict[str, Any] = {
+            "data_source": data_source,
+            "sub_source": sub_source,
+            "pre_agent": pre_agent,         # dict of agent_id: prompt
+            "sample_id": sample_id,
+            "instance_id": instance_id,
+            "question_idx": q_idx,
+            "turn_roles": turn_roles,               # list
+            "turn_metadata": turn_metadata,         # list of dicts
+        }
+        if reading_dates:
+            extra_info_str["reading_dates"] = reading_dates
+
+        extra_info_str = _json_dumps(extra_info_str)
+
+        row = {
+                "prompt": _json_dumps(prompt),
+                "chunks": _json_dumps(chunks),      # list
+                "num_chunks": len(chunks),
+                "question": question,
+                "answers": _json_dumps(answers_list),  # list
+                "target_answer": answers_list[0] if answers_list else "",
+                "agent_role": "answer_gen",
+                "data_source": data_source,
+                "sub_source": sub_source,
+                "extra_info": extra_info_str,       # second-order nested dict
+                "metadata": _json_dumps(metadata),
+            }
+        
+        # assert all stored values are acceptable types
+        for k, v in row.items():
+            assert isinstance(v, str) or isinstance(v, int) or isinstance(v, float) , f"Expected value to be str, int, or float, got {type(v)} for key {k}"
+
+        rows.append(row)
         
     return rows
 
@@ -443,9 +553,11 @@ def _chunk_context_longmemeval(contexts: str, max_tokens: int, tokenizer: AutoTo
 def process_memoryagentbench_raw(
     *,
     split: Optional[str] = None,
-    output_path: str = "./data/memoryagentbench_qa_raw.parquet",
+    output_path: str = "./data",
     max_tokens_per_chunk: int = 2048,
-    keywords_path: Optional[str] = None,
+    split_test: Optional[float] = 0.2,
+    batch_size: int = 500,
+    resume: bool = False,
 ) -> str:
     """
     从 HuggingFace 原始数据集生成 QA-level parquet。
@@ -463,18 +575,59 @@ def process_memoryagentbench_raw(
     
     qwen_tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-32B", trust_remote_code=True)
     
-    rows: List[Dict[str, Any]] = []
-    
-    if 'Long_Range_Understanding' in split:
-        if keywords_path is not None:
-            with open(keywords_path, 'r') as file:
-                answers_to_keywords_mapping = json.load(file)
-        else:
-            raise ValueError("keywords_path is required for Long_Range_Understanding split")
+    if split_test is not None and split_test <= 0:
+        split_test = None
+
+    assert split_test is None or 0 < split_test < 1, "split_test should be None or in (0, 1)"
+
+    def _suffix_path(path: str, suffix: str) -> str:
+        if path.endswith(".parquet"):
+            return path.replace(".parquet", f"_{suffix}.parquet")
+        return f"{path}/MemoryAgentBench_from_raw_{suffix}.parquet"
+
+    if split_test:
+        train_output = _suffix_path(output_path, "train")
+        test_output = _suffix_path(output_path, "test")
+        print(f"Processing train and test data, train output path: {train_output}, test output path: {test_output}")
+    else:
+        train_output = output_path
+        test_output = None
+        print(f"Processing all data, output path: {train_output}")
+
+    rng = random.Random(42)
+
+    buffers: Dict[str, List[Dict[str, Any]]] = {"train": []}
+    writers: Dict[str, _ParquetBatchWriter | None] = {
+        "train": _ParquetBatchWriter(train_output, resume=resume)
+    }
+    resume_counters: Dict[str, int] = {
+        "train": writers["train"].resume_rows if writers["train"] else 0
+    }
+
+    if test_output:
+        writers["test"] = _ParquetBatchWriter(test_output, resume=resume)
+        buffers["test"] = []
+        resume_counters["test"] = writers["test"].resume_rows if writers["test"] else 0
+    else:
+        writers["test"] = None
+
+    def _append_row(row: Dict[str, Any], target: str) -> None:
+        writer = writers.get(target)
+        if writer is None:
+            target = "train"
+            writer = writers[target]
+        if resume_counters[target] > 0:
+            resume_counters[target] -= 1
+            return
+        buffers[target].append(row)
+        if len(buffers[target]) >= batch_size:
+            writer.write_rows(buffers[target])
+            buffers[target].clear()
 
     for split_name, dataset in zip(split, ds):
-    # iterate over each item in the dataset
-        for item_idx, item in enumerate(dataset):
+        print(f"Processing split: {split_name}")
+        # iterate over each item in the current dataset split
+        for item_idx, item in tqdm(enumerate(dataset), total=len(dataset)):
             
             source = item['metadata']['source']
             context = item['context']
@@ -502,38 +655,112 @@ def process_memoryagentbench_raw(
                 chunks = _chunk_by_sentences(context, 2048)
                 qa_pairs = [{'question': question, 'answer': answer} for question, answer in zip(questions, answers)]
 
-            rows.extend(
-                _qa_rows_from_entry_multi_agent(
-                    chunks=chunks,
-                    qa_pairs=qa_pairs,
-                    base_sample_id=item_idx,
-                    data_source=split_name,
-                    sub_source=metadata.get("source"),
-                    agent_ids=["answer_gen", "fact_split", "long_mem", "short_mem"],
-                )
+            sample_rows = _qa_rows_from_entry_multi_agent(
+                chunks=chunks,
+                qa_pairs=qa_pairs,
+                base_sample_id=item_idx,
+                data_source=split_name,
+                metadata=metadata,
+                agent_ids=["answer_gen", "fact_split", "long_mem", "short_mem"],
             )
 
+            for row in sample_rows:
+                if test_output and rng.random() < split_test:
+                    _append_row(row, "test")
+                else:
+                    _append_row(row, "train")
+
         # TODO: missing chunk date synthesis process
-        
-    return _save_rows(rows, output_path)
 
+    for target in ["train", "test"]:
+        writer = writers.get(target)
+        if not writer:
+            continue
+        if buffers[target]:
+            writer.write_rows(buffers[target])
+            buffers[target].clear()
+        writer.close()
 
+    return train_output
 
 # -------------------------
 # 处理路径 2：基于 mem-alpha 产出的 chunk-level JSON/Parquet
 # -------------------------
 
-def process_memoryagentbench_from_memalpha(
+def process_dataset_from_memalpha(
     *,
-    input_path: str,
-    output_path: str = "./data/memoryagentbench_qa_from_memalpha.parquet",
-    system_prompt: str = "You are a helpful memory-augmented assistant.",
-    limit: int | None = None,
+    memalpha_path: str,
+    output_path: str = "./data",
+    split: str = "train",
+    batch_size: int = 500,
+    resume: bool = False,
 ) -> str:
 
-    pass # TODO: 实现 加载mem-alpha的数据集并拓展成QA-level数据集
+    assert split in {"train", "test"}, "split 仅支持 train/test"
+
+    try:
+        memalpha_ds = load_dataset("parquet", data_files=memalpha_path, split=split)
+    except Exception:
+        memalpha_ds = load_dataset(memalpha_path, split=split)
 
 
+    target_path = (
+        output_path.replace(".parquet", f"Memalpha_{split}.parquet")
+        if output_path.endswith(".parquet")
+        else f"{output_path}/Memalpha_{split}.parquet"
+    )
+    
+    print(f"Processing {split} data, output path: {target_path}")
+    
+
+    writer = _ParquetBatchWriter(target_path, resume=resume)
+    buffer: List[Dict[str, Any]] = []
+    rows_to_skip = writer.resume_rows
+
+    def _flush_buffer() -> None:
+        if buffer:
+            writer.write_rows(buffer)
+            buffer.clear()
+
+    for item_idx, item in tqdm(enumerate(memalpha_ds), total=len(memalpha_ds)):
+        metadata_root = json.loads(item["metadata"])
+        nested_meta = metadata_root.get("metadata")
+        if isinstance(nested_meta, str):
+            nested_meta = json.loads(nested_meta)
+        if not isinstance(nested_meta, dict):
+            nested_meta = {}
+        chunks = item["chunks"]
+        qa_pairs = [
+            {"question": pair["question"], "answer": pair["answer"]}
+            for pair in json.loads(item["questions_and_answers"])
+        ]
+
+        sample_rows = _qa_rows_from_entry_multi_agent(
+            chunks=chunks,
+            qa_pairs=qa_pairs,
+            base_sample_id=item_idx,
+            data_source=metadata_root["data_source"],
+            metadata=nested_meta,
+            agent_ids=["answer_gen", "fact_split", "long_mem", "short_mem"],
+        )
+
+        if rows_to_skip > 0:
+            if rows_to_skip >= len(sample_rows):
+                rows_to_skip -= len(sample_rows)
+                continue
+            sample_rows = sample_rows[rows_to_skip:]
+            rows_to_skip = 0
+
+        buffer.extend(sample_rows)
+        if len(buffer) >= batch_size:
+            _flush_buffer()
+
+    _flush_buffer()
+    writer.close()
+
+    return target_path
+        
+        
 # -------------------------
 # CLI
 # -------------------------
@@ -541,30 +768,40 @@ def process_memoryagentbench_from_memalpha(
 def main() -> None:
     parser = argparse.ArgumentParser(description="MemoryAgentBench QA-level 预处理")
     parser.add_argument("--mode", choices=["raw", "memalpha"], required=True, help="处理路径")
-    parser.add_argument("--split", default="Accurate_Retrieval", help="HF split（raw 模式）")
-    parser.add_argument("--input_path", type=str, default="", help="memalpha 模式输入文件")
+    parser.add_argument("--split", default="Accurate_Retrieval", help="For processing data from HF raw dataset, specify the split name (with None == all splites); For processing data from processed memalpha dataset, specify the train/test split (doesn't accept NoneType)")
+    parser.add_argument("--split_test", type=float, default=0.2, help="raw 模式下划分测试集占比，传入 None 则不切分")
+    parser.add_argument("--memalpha_path", type=str, default=None, help="memalpha 模式输入文件")
     parser.add_argument("--output_path", type=str, default="./data/memoryagentbench_qa.parquet", help="输出 parquet 路径")
-    parser.add_argument("--limit", type=int, default=None, help="仅处理前 N 条，便于调试")
     parser.add_argument("--max_tokens_per_chunk", type=int, default=2048, help="raw 模式 chunk 最大 token 数")
-    parser.add_argument("--system_prompt", type=str, default="You are a helpful memory-augmented assistant.", help="系统提示词")
+    parser.add_argument("--batch_size", type=int, default=500, help="每次写入 parquet 前的缓存样本数")
+    parser.add_argument("--resume", action="store_true", default=False, help="若已有输出文件则复用其内容并从对应行号续跑")
+
     args = parser.parse_args()
 
     if args.mode == "raw":
+        
+        assert args.split in ["Accurate_Retrieval", "Test_Time_Learning", "Long_Range_Understanding", "Long_Range_Understanding_v2"], "For processing data from HF raw dataset, specify the split name (with None == all splites)"
+        
         path = process_memoryagentbench_raw(
             split=args.split,
             output_path=args.output_path,
             max_tokens_per_chunk=args.max_tokens_per_chunk,
-            limit=args.limit,
-            system_prompt=args.system_prompt,
+            split_test=args.split_test,
+            batch_size=args.batch_size,
+            resume=args.resume,
         )
     else:
-        if not args.input_path:
-            raise ValueError("memalpha 模式需要提供 --input_path")
-        path = process_memoryagentbench_from_memalpha(
-            input_path=args.input_path,
+        
+        assert args.split in ['train', 'test'], "For processing data from processed memalpha dataset, specify the train/test split (doesn't accept NoneType)"
+        
+        if not args.memalpha_path:
+            raise ValueError("memalpha 模式需要提供 --memalpha_path")
+        path = process_dataset_from_memalpha(
+            memalpha_path=args.memalpha_path,
             output_path=args.output_path,
-            system_prompt=args.system_prompt,
-            limit=args.limit,
+            split=args.split,
+            batch_size=args.batch_size,
+            resume=args.resume,
         )
 
     print(f"Saved QA-level dataset to: {path}")

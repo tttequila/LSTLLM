@@ -3,3 +3,8 @@ MemAgent/
 .history/
 # project_notes/
 .cursor/
+lhy.py
+data/tmp
+**/__pycache__/
+data/Memalpha*
+data/MemoryAgentBench*
